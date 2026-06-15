@@ -1,3 +1,14 @@
+---
+title: Crypto AI Entry Assistant
+emoji: ??
+colorFrom: gray
+colorTo: blue
+sdk: streamlit
+sdk_version: 1.36.0
+app_file: app.py
+pinned: false
+---
+
 # AI进场助手
 
 这是一个 Python + Streamlit 写的加密货币交易辅助工具。它会把多周期行情分析整理成普通人能直接看懂的每日交易计划：
