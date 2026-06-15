@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.tools/
+*.log
+trade_records.csv
+.streamlit/secrets.toml
