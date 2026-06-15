@@ -1,6 +1,5 @@
 ---
 title: Crypto AI Entry Assistant
-emoji: ??
 colorFrom: gray
 colorTo: blue
 sdk: streamlit
