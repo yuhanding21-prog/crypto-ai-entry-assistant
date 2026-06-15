@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .tools/
+.hf_deploy/
 *.log
 trade_records.csv
 .streamlit/secrets.toml

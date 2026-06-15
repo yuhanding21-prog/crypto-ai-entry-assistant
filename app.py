@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.error import URLError
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import numpy as np
 import pandas as pd
@@ -183,14 +187,45 @@ def load_market_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return data
 
 
+def ticker_to_binance_symbol(ticker: str) -> str:
+    base = ticker.upper().replace("-USD", "").replace("-USDT", "").replace("USD", "").replace("USDT", "")
+    return f"{base}USDT"
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_binance_market_data(ticker: str, interval: str) -> pd.DataFrame:
+    params = urlencode({"symbol": ticker_to_binance_symbol(ticker), "interval": interval, "limit": 500})
+    url = f"https://api.binance.com/api/v3/klines?{params}"
+    try:
+        with urlopen(url, timeout=10) as response:
+            rows = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, TimeoutError, json.JSONDecodeError):
+        return pd.DataFrame()
+    if not rows or not isinstance(rows, list):
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=[
+        "OpenTime", "Open", "High", "Low", "Close", "Volume", "CloseTime",
+        "QuoteVolume", "Trades", "TakerBuyBase", "TakerBuyQuote", "Ignore",
+    ])
+    df.index = pd.to_datetime(df["OpenTime"], unit="ms")
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+
 def load_all_timeframes(ticker: str) -> dict[str, pd.DataFrame]:
     result = {}
     for name, cfg in TIMEFRAMES.items():
         raw = load_market_data(ticker, cfg["period"], cfg["interval"])
+        used_binance = False
+        if raw.empty:
+            fallback_interval = "4h" if cfg.get("resample") == "4h" else cfg["interval"]
+            raw = load_binance_market_data(ticker, fallback_interval)
+            used_binance = not raw.empty
         if raw.empty:
             result[name] = raw
             continue
-        if cfg.get("resample") == "4h":
+        if cfg.get("resample") == "4h" and not used_binance:
             raw = raw.resample("4h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
         result[name] = add_indicators(raw)
     return result
@@ -1068,6 +1103,81 @@ def inject_css() -> None:
             background: rgba(239,68,68,.12);
             color: #fecaca;
         }
+        .mobile-only {
+            display: none !important;
+        }
+        .desktop-only {
+            display: block !important;
+        }
+        @media (max-width: 768px) {
+            section[data-testid="stSidebar"] {
+                display: none !important;
+            }
+            .block-container {
+                padding-left: 1rem !important;
+                padding-right: 1rem !important;
+                padding-top: 1rem !important;
+                padding-bottom: 2rem !important;
+                max-width: 100% !important;
+            }
+            .main-title, h1 {
+                font-size: 32px !important;
+                line-height: 1.2 !important;
+            }
+            div[data-testid="stHorizontalBlock"] {
+                flex-direction: column !important;
+                gap: 0.75rem !important;
+            }
+            div[data-testid="stHorizontalBlock"] > div {
+                width: 100% !important;
+                min-width: 100% !important;
+            }
+            .stButton > button, .stFormSubmitButton > button {
+                width: 100% !important;
+                min-height: 44px !important;
+                margin-bottom: 8px !important;
+                font-size: 16px !important;
+                padding: 10px 12px !important;
+            }
+            .trade-card, .hero-card, .setup-card {
+                width: 100% !important;
+                margin-bottom: 18px !important;
+                padding: 18px !important;
+                border-radius: 14px !important;
+            }
+            .hero-price {
+                font-size: 34px !important;
+            }
+            .hero-line {
+                font-size: 18px !important;
+            }
+            .kv-grid {
+                grid-template-columns: 1fr !important;
+            }
+            .kv-value, div[data-testid="stMetricValue"] {
+                font-size: 28px !important;
+            }
+            .desktop-only {
+                display: none !important;
+            }
+            .mobile-only {
+                display: block !important;
+            }
+            div[data-testid="stForm"]:has(.mobile-form-marker) {
+                display: block !important;
+            }
+        }
+        @media (min-width: 769px) {
+            .desktop-only {
+                display: block !important;
+            }
+            .mobile-only {
+                display: none !important;
+            }
+            div[data-testid="stForm"]:has(.mobile-form-marker) {
+                display: none !important;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1917,99 +2027,140 @@ def sidebar_inputs() -> tuple[str, str, str, float, float, int, float, str, floa
     return symbol_input, must_mode, direction_choice, rmb_capital, risk_pct, int(leverage), rate, unit, fee_pct, margin_mode, clicked
 
 
-def render_home() -> None:
-    st.title("合约交易决策面板")
-    st.caption("像交易员的每日计划：先看动作，再看点位，最后看最多亏多少。")
+def params_from_values(symbol_input: str, must_mode: str, direction_choice: str, rmb_capital: float, risk_pct: float, leverage: int, rate: float, unit: str, fee_pct: float, margin_mode: str, clicked: bool, source: str) -> dict[str, object]:
+    return {
+        "symbol_input": symbol_input,
+        "must_mode": must_mode,
+        "direction_choice": direction_choice,
+        "rmb_capital": float(rmb_capital),
+        "risk_pct": float(risk_pct),
+        "leverage": int(leverage),
+        "rate": float(rate),
+        "unit": unit,
+        "fee_pct": float(fee_pct),
+        "margin_mode": margin_mode,
+        "clicked": bool(clicked),
+        "source": source,
+    }
+
+
+def get_trade_inputs_desktop() -> dict[str, object]:
     symbol_input, must_mode, direction_choice, rmb_capital, risk_pct, leverage, rate, unit, fee_pct, margin_mode, clicked = sidebar_inputs()
-    required_state = ["daily_plan", "forced_plan", "signals", "coin", "unit"]
-    if not clicked and any(key not in st.session_state for key in required_state):
-        st.markdown("<div class='notice'>在左侧填写参数，然后点击“生成交易面板”。默认逐仓、3x、单笔风险1%。</div>", unsafe_allow_html=True)
-        return
-    if risk_pct > 5:
-        st.error("风险过高，不建议。单笔风险超过5%很容易几次亏损就伤到账户。")
+    return params_from_values(symbol_input, must_mode, direction_choice, rmb_capital, risk_pct, leverage, rate, unit, fee_pct, margin_mode, clicked, "desktop")
+
+
+def get_trade_inputs_mobile() -> dict[str, object]:
+    with st.form("mobile_entry_form"):
+        st.markdown("<span class='mobile-form-marker'></span>", unsafe_allow_html=True)
+        st.markdown("<div class='section-title mobile-only'>交易参数</div>", unsafe_allow_html=True)
+        symbol_input = st.text_input("币种", value=st.session_state.get("symbol_input_mobile", "ETH/USDT"), key="symbol_input_mobile")
+        col1, col2 = st.columns(2)
+        rmb_capital = col1.number_input("人民币本金", min_value=10.0, value=1000.0, step=100.0, key="rmb_capital_mobile")
+        rate = col2.number_input("USDT/CNY 汇率", min_value=0.1, value=7.2, step=0.01, key="rate_mobile")
+        col1, col2 = st.columns(2)
+        risk_pct = col1.number_input("单笔最大风险 %", min_value=0.1, max_value=20.0, value=1.0, step=0.1, key="risk_pct_mobile")
+        leverage = col2.number_input("杠杆倍数", min_value=1, max_value=50, value=3, step=1, key="leverage_mobile")
+        direction_choice = st.radio("做多/做空", ["auto", "long", "short"], index=0, format_func=lambda value: {"auto": "系统判断", "long": "只做多", "short": "只做空"}[value], key="direction_choice_mobile")
+        must_mode = st.radio("是否必须做这一单", ["normal", "today", "now"], index=0, format_func=lambda value: {"normal": "否", "today": "今天必须做", "now": "现在必须进"}[value], key="must_mode_mobile")
+        unit = st.radio("欧易数量单位", ["ETH", "USDT"], horizontal=True, index=0, key="unit_mobile")
+        fee_pct = st.number_input("手续费率 %", min_value=0.0, max_value=1.0, value=0.05, step=0.01, key="fee_pct_mobile")
+        margin_mode = "逐仓"
+        clicked = st.form_submit_button("生成交易建议", type="primary", use_container_width=True)
+    return params_from_values(symbol_input, must_mode, direction_choice, rmb_capital, risk_pct, int(leverage), rate, unit, fee_pct, margin_mode, clicked, "mobile")
+
+
+def clear_last_plan_state() -> None:
+    for key in ["daily_plan", "forced_plan", "signals", "coin", "unit", "long_short_scores", "selected_plan", "strong_trend_data", "strong_trend_symbol", "last_plan"]:
+        st.session_state.pop(key, None)
+
+
+def generate_trade_plan(params: dict[str, object]) -> dict[str, object]:
+    symbol_input = str(params["symbol_input"])
+    must_mode = str(params["must_mode"])
+    direction_choice = str(params["direction_choice"])
+    rmb_capital = float(params["rmb_capital"])
+    risk_pct = float(params["risk_pct"])
+    leverage = int(params["leverage"])
+    rate = float(params["rate"])
+    unit = str(params["unit"])
+    fee_pct = float(params["fee_pct"])
+    margin_mode = str(params["margin_mode"])
     ticker, symbol = symbol_to_yfinance(symbol_input)
-    if clicked:
-        for key in ["daily_plan", "forced_plan", "signals", "coin", "unit", "long_short_scores", "selected_plan", "strong_trend_data", "strong_trend_symbol"]:
-            st.session_state.pop(key, None)
-        with st.spinner("正在分析并生成方案..."):
-            data = load_all_timeframes(ticker)
-            signals = [analyze_timeframe(name, df) for name, df in data.items()]
-            signals = [item for item in signals if item is not None]
-        if len(signals) < 3:
-            snapshot = market_snapshot_from_data(data)
-            if snapshot is None:
-                st.warning("行情数据暂时拿不到完整K线。保守处理：不追高，等回踩，仓位减半；刷新后再重新评估。")
-                return
-            strong_data = build_strong_trend_plans(
-                snapshot["current"],
-                snapshot["support"],
-                snapshot["resistance"],
-                rmb_capital,
-                risk_pct,
-                int(leverage),
-                rate,
-                must_mode,
-            )
-            st.session_state.strong_trend_data = strong_data
-            st.session_state.strong_trend_symbol = symbol
-            st.session_state.coin = base_coin(symbol)
-            st.session_state.unit = unit
-            st.session_state.risk_inputs = {"rmb_capital": rmb_capital, "risk_pct": risk_pct, "leverage": min(int(leverage), 3), "rate": rate, "direction_choice": "long", "fee_pct": fee_pct, "margin_mode": margin_mode, "must_mode": must_mode}
-            st.session_state.forced_plan = strong_data["selected"] if must_mode == "now" else None
-            st.session_state.selected_plan = strong_data["selected"]
-            st.session_state.signals = signals
-            render_strong_trend_mode(symbol, strong_data, base_coin(symbol), unit, margin_mode, fee_pct, rmb_capital, rate, must_mode)
-            st.markdown("<div class='notice'>仅供参考，不构成投资建议，不自动下单。先确定最多亏多少钱，再决定开多少仓。</div>", unsafe_allow_html=True)
-            st.markdown("<div class='notice danger-notice'>不到点位不开仓，没有止损不开仓，亏损金额不能接受不开仓。</div>", unsafe_allow_html=True)
-            return
-        base_daily = build_daily_plan(symbol, signals, rmb_capital / rate, min(risk_pct, 1))
-        long_score, short_score = calculate_long_short_scores(signals)
-        side = choose_direction(direction_choice, long_score, short_score)
-        candidate_plans = build_candidates(signals, side, rmb_capital, risk_pct, int(leverage), rate)
-        daily = daily_with_direction_plans(base_daily, candidate_plans, side)
-        if normalize_side(side) == "long" and is_strong_trend(signals, daily, candidate_plans):
-            current = daily.current_price
-            resistance = max(signal.resistance for signal in signals[:3])
-            support = min(signal.support for signal in signals[:3])
-            strong_data = build_strong_trend_plans(current, support, resistance, rmb_capital, risk_pct, int(leverage), rate, must_mode)
-            if must_mode == "now":
-                st.session_state.now_force_count = st.session_state.get("now_force_count", 0) + 1
-            st.session_state.strong_trend_data = strong_data
-            st.session_state.strong_trend_symbol = symbol
-            st.session_state.coin = base_coin(symbol)
-            st.session_state.unit = unit
-            st.session_state.risk_inputs = {"rmb_capital": rmb_capital, "risk_pct": min(risk_pct, 0.5) if must_mode == "now" else risk_pct, "leverage": min(int(leverage), 3), "rate": rate, "direction_choice": "long", "fee_pct": fee_pct, "margin_mode": margin_mode, "must_mode": must_mode}
-            st.session_state.forced_plan = strong_data["selected"] if must_mode == "now" else None
-            st.session_state.selected_plan = strong_data["selected"]
-            st.session_state.signals = signals
-            return
-        is_choppy_choice = direction_choice == "auto" and abs(long_score - short_score) < 5
-        if must_mode == "now":
-            st.session_state.now_force_count = st.session_state.get("now_force_count", 0) + 1
-            forced = build_now_plan(signals, side, rmb_capital, risk_pct, int(leverage), rate)
-        elif must_mode == "today":
-            forced = choose_candidate(candidate_plans, daily.current_price)
-        else:
-            st.session_state.now_force_count = 0
-            forced = None
-        if forced is not None and is_choppy_choice:
-            forced.warning = f"震荡，只能轻仓。多头评分 {long_score:.0f}，空头评分 {short_score:.0f}。{forced.warning}"
-        selected_plan = forced or choose_candidate(candidate_plans, daily.current_price)
-        st.session_state.daily_plan = daily
-        st.session_state.forced_plan = forced
-        st.session_state.selected_plan = selected_plan
-        st.session_state.signals = signals
-        st.session_state.coin = base_coin(symbol)
-        st.session_state.unit = unit
-        st.session_state.long_short_scores = (long_score, short_score)
-        st.session_state.risk_inputs = {"rmb_capital": rmb_capital, "risk_pct": risk_pct, "leverage": int(leverage), "rate": rate, "direction_choice": direction_choice, "fee_pct": fee_pct, "margin_mode": margin_mode, "must_mode": must_mode}
-    if st.session_state.get("strong_trend_data") is not None:
-        risk_inputs = st.session_state.get("risk_inputs", {"rmb_capital": 1000, "risk_pct": 1, "leverage": 3, "rate": 7.2, "fee_pct": 0.05, "margin_mode": "逐仓", "must_mode": "normal"})
+    data = load_all_timeframes(ticker)
+    signals = [analyze_timeframe(name, df) for name, df in data.items()]
+    signals = [item for item in signals if item is not None]
+    common = {
+        "symbol": symbol,
+        "coin": base_coin(symbol),
+        "unit": unit,
+        "risk_inputs": {"rmb_capital": rmb_capital, "risk_pct": risk_pct, "leverage": leverage, "rate": rate, "direction_choice": direction_choice, "fee_pct": fee_pct, "margin_mode": margin_mode, "must_mode": must_mode},
+        "signals": signals,
+    }
+    if len(signals) < 3:
+        snapshot = market_snapshot_from_data(data)
+        if snapshot is None:
+            return {
+                **common,
+                "kind": "fallback",
+                "message": "行情数据不足，无法精确分析。但建议：不市价追单，只在关键支撑/压力附近轻仓测试。",
+            }
+        strong_data = build_strong_trend_plans(snapshot["current"], snapshot["support"], snapshot["resistance"], rmb_capital, risk_pct, leverage, rate, must_mode)
+        return {**common, "kind": "strong", "strong_trend_data": strong_data}
+
+    base_daily = build_daily_plan(symbol, signals, rmb_capital / rate, min(risk_pct, 1))
+    long_score, short_score = calculate_long_short_scores(signals)
+    side = choose_direction(direction_choice, long_score, short_score)
+    candidate_plans = build_candidates(signals, side, rmb_capital, risk_pct, leverage, rate)
+    daily = daily_with_direction_plans(base_daily, candidate_plans, side)
+    if normalize_side(side) == "long" and is_strong_trend(signals, daily, candidate_plans):
+        current = daily.current_price
+        resistance = max(signal.resistance for signal in signals[:3])
+        support = min(signal.support for signal in signals[:3])
+        strong_data = build_strong_trend_plans(current, support, resistance, rmb_capital, risk_pct, leverage, rate, must_mode)
+        return {**common, "kind": "strong", "strong_trend_data": strong_data}
+
+    is_choppy_choice = direction_choice == "auto" and abs(long_score - short_score) < 5
+    if must_mode == "now":
+        forced = build_now_plan(signals, side, rmb_capital, risk_pct, leverage, rate)
+    elif must_mode == "today":
+        forced = choose_candidate(candidate_plans, daily.current_price)
+    else:
+        forced = None
+    if forced is not None and is_choppy_choice:
+        forced.warning = f"震荡，只能轻仓。多头评分 {long_score:.0f}，空头评分 {short_score:.0f}。{forced.warning}"
+    selected_plan = forced or choose_candidate(candidate_plans, daily.current_price)
+    return {
+        **common,
+        "kind": "normal",
+        "daily": daily,
+        "forced": forced,
+        "selected_plan": selected_plan,
+        "long_short_scores": (long_score, short_score),
+        "choppy_wait": is_choppy_choice,
+    }
+
+
+def render_trade_result(plan: dict[str, object]) -> None:
+    kind = plan.get("kind")
+    risk_inputs = plan["risk_inputs"]
+    if kind == "fallback":
+        html_card(
+            "当前最优建议",
+            f"""
+            <div class='big-money yellow'>保守等待</div>
+            <div class='notice'>{plan["message"]}</div>
+            <div class='notice danger-notice'>价格跑太快或数据不完整时，不追高，等回踩，仓位减半。</div>
+            """,
+        )
+        st.markdown("<div class='notice'>仅供参考，不构成投资建议，不自动下单。先确定最多亏多少钱，再决定开多少仓。</div>", unsafe_allow_html=True)
+        st.markdown("<div class='notice danger-notice'>不到点位不开仓，没有止损不开仓，亏损金额不能接受不开仓。</div>", unsafe_allow_html=True)
+        return
+    if kind == "strong":
         render_strong_trend_mode(
-            st.session_state.get("strong_trend_symbol", symbol),
-            st.session_state.strong_trend_data,
-            st.session_state.get("coin", base_coin(symbol)),
-            st.session_state.get("unit", unit),
+            str(plan["symbol"]),
+            plan["strong_trend_data"],
+            str(plan["coin"]),
+            str(plan["unit"]),
             risk_inputs["margin_mode"],
             risk_inputs["fee_pct"],
             risk_inputs["rmb_capital"],
@@ -2019,53 +2170,28 @@ def render_home() -> None:
         st.markdown("<div class='notice'>仅供参考，不构成投资建议，不自动下单。先确定最多亏多少钱，再决定开多少仓。</div>", unsafe_allow_html=True)
         st.markdown("<div class='notice danger-notice'>不到点位不开仓，没有止损不开仓，亏损金额不能接受不开仓。</div>", unsafe_allow_html=True)
         return
-    if any(key not in st.session_state for key in required_state):
-        st.markdown("<div class='notice'>页面状态已更新，请在左侧重新点击“生成交易面板”。</div>", unsafe_allow_html=True)
-        return
 
-    daily, forced, signals = st.session_state.daily_plan, st.session_state.forced_plan, st.session_state.signals
-    coin, unit = st.session_state.coin, st.session_state.unit
-    long_score, short_score = st.session_state.get("long_short_scores", calculate_long_short_scores(signals))
-    risk_inputs = st.session_state.get("risk_inputs", {"rmb_capital": 1000, "risk_pct": 1, "leverage": 3, "rate": 7.2, "direction_choice": "auto", "fee_pct": 0.05, "margin_mode": "逐仓", "must_mode": "normal"})
-    selected_plan = st.session_state.get("selected_plan")
-    if selected_plan is None:
-        selected_side = choose_direction(risk_inputs["direction_choice"], long_score, short_score)
-        selected_plan = choose_candidate(
-            build_candidates(signals, selected_side, risk_inputs["rmb_capital"], risk_inputs["risk_pct"], risk_inputs["leverage"], risk_inputs["rate"]),
-            daily.current_price,
-        )
-    choppy_wait = risk_inputs.get("direction_choice") == "auto" and abs(long_score - short_score) < 5
-    render_top_card(daily, forced, selected_plan, long_score, short_score, choppy_wait)
+    daily = plan["daily"]
+    forced = plan["forced"]
+    selected_plan = plan["selected_plan"]
+    long_score, short_score = plan["long_short_scores"]
+    render_top_card(daily, forced, selected_plan, long_score, short_score, bool(plan.get("choppy_wait", False)))
     render_distance_panel(daily)
-
     st.markdown("<div class='section-title'>今日两个交易方案</div>", unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
         render_setup(daily.aggressive)
     with col2:
         render_setup(daily.conservative)
-
     if forced is None:
-        render_forced_plan(
-            selected_plan,
-            "如果必须做这一单，参考这个方案",
-            "正常模式下，不到计划价格不做；如果你非要做，只能照这个方案小仓执行。",
-        )
+        render_forced_plan(selected_plan, "如果必须做这一单，参考这个方案", "正常模式下，不到计划价格不做；如果你非要做，只能照这个方案小仓执行。")
     else:
         render_forced_plan(selected_plan)
-
-    render_okx_fill(selected_plan, coin, unit, risk_inputs["margin_mode"], daily.current_price)
+    render_okx_fill(selected_plan, str(plan["coin"]), str(plan["unit"]), risk_inputs["margin_mode"], daily.current_price)
     render_profit_preview(selected_plan, risk_inputs["fee_pct"], risk_inputs["rmb_capital"], risk_inputs["rate"])
     render_trade_value(selected_plan, risk_inputs["risk_pct"], risk_inputs["leverage"])
-
     render_today_donts(daily, selected_plan)
-    render_discipline(
-        risk_inputs["risk_pct"],
-        risk_inputs["leverage"],
-        selected_plan.reward_risk,
-        risk_inputs.get("must_mode", "normal"),
-        st.session_state.get("now_force_count", 0),
-    )
+    render_discipline(risk_inputs["risk_pct"], risk_inputs["leverage"], selected_plan.reward_risk, risk_inputs.get("must_mode", "normal"), st.session_state.get("now_force_count", 0))
     if max_consecutive_losses(read_trade_records()) >= 3:
         st.error("交易记录显示已经连续亏损 3 次：今天停止交易。")
     html_card("AI分析理由", f"<div style='font-size:18px;line-height:1.7'>{daily.analysis_reason}</div>")
@@ -2075,15 +2201,31 @@ def render_home() -> None:
     if st.button("保存本次计划", use_container_width=True):
         append_trade_record(build_trade_record(daily, selected_plan, risk_inputs.get("must_mode", "normal"), risk_inputs["margin_mode"], risk_inputs["fee_pct"]))
         st.success(f"已保存到本地 CSV：{TRADE_RECORDS_FILE}")
-    st.download_button(
-        "下载交易计划 TXT",
-        data=build_plan_text(daily, selected_plan, coin, unit, risk_inputs["fee_pct"], risk_inputs["margin_mode"]),
-        file_name=f"{coin}_trade_plan.txt",
-        mime="text/plain",
-        use_container_width=True,
-    )
+    st.download_button("下载交易计划 TXT", data=build_plan_text(daily, selected_plan, str(plan["coin"]), str(plan["unit"]), risk_inputs["fee_pct"], risk_inputs["margin_mode"]), file_name=f"{plan['coin']}_trade_plan.txt", mime="text/plain", use_container_width=True)
     st.markdown("<div class='notice'>仅供参考，不构成投资建议，不自动下单。先确定最多亏多少钱，再决定开多少仓。</div>", unsafe_allow_html=True)
     st.markdown("<div class='notice danger-notice'>不到点位不开仓，没有止损不开仓，亏损金额不能接受不开仓。</div>", unsafe_allow_html=True)
+
+
+def render_home() -> None:
+    st.markdown("<h1 class='main-title'>合约交易决策面板</h1>", unsafe_allow_html=True)
+    st.caption("像交易员的每日计划：先看动作，再看点位，最后看最多亏多少。")
+    desktop_params = get_trade_inputs_desktop()
+    mobile_params = get_trade_inputs_mobile()
+    active_params = mobile_params if mobile_params["clicked"] else desktop_params
+    if active_params["clicked"]:
+        if active_params["must_mode"] == "now":
+            st.session_state.now_force_count = st.session_state.get("now_force_count", 0) + 1
+        elif active_params["must_mode"] == "normal":
+            st.session_state.now_force_count = 0
+        clear_last_plan_state()
+        with st.spinner("正在分析并生成方案..."):
+            st.session_state["last_plan"] = generate_trade_plan(active_params)
+
+    if "last_plan" in st.session_state:
+        render_trade_result(st.session_state["last_plan"])
+    else:
+        st.markdown("<div class='notice desktop-only'>在左侧填写参数，然后点击“生成交易面板”。默认逐仓、3x、单笔风险1%。</div>", unsafe_allow_html=True)
+        st.markdown("<div class='notice mobile-only'>在上方填写交易参数，然后点击“生成交易建议”。默认逐仓、3x、单笔风险1%。</div>", unsafe_allow_html=True)
 
 
 def render_order_helper() -> None:
