@@ -624,6 +624,205 @@ def calculate_order_helper(rmb_capital: float, current_price: float, side: str, 
     return OrderHelperResult(rmb_capital / rmb_per_usdt, max_loss, position, quantity, margin, target1_price, target2_price, estimated_loss, profit1, profit2, open_fee, close_stop, close_t1, close_t2, total_stop, total_t1, total_t2, estimated_loss + total_stop, profit1 - total_t1, profit2 - total_t2, rr1, profit2 / max(max_loss, 0.000001), risk_too_high, warning)
 
 
+def market_snapshot_from_data(data: dict[str, pd.DataFrame]) -> dict[str, float] | None:
+    for name in ["15分钟", "1小时", "4小时", "日线"]:
+        df = data.get(name)
+        if df is not None and not df.empty and {"Close", "High", "Low"}.issubset(df.columns):
+            recent = df.tail(min(len(df), 80))
+            current = float(recent["Close"].iloc[-1])
+            previous = recent.iloc[:-1] if len(recent) > 1 else recent
+            resistance = float(previous["High"].max())
+            support = float(previous["Low"].min())
+            short_window = recent.tail(min(len(recent), 8))
+            start = float(short_window["Close"].iloc[0])
+            short_gain = current / start - 1 if start > 0 else 0
+            return {
+                "current": current,
+                "support": min(support, current * 0.98),
+                "resistance": max(resistance, current * 0.995),
+                "short_gain": short_gain,
+            }
+    return None
+
+
+def is_strong_trend(signals: list[TimeframeSignal], daily: DailyPlan | None, candidates: list[ForcedPlan] | None = None) -> bool:
+    if not signals:
+        return False
+    current = signals[0].price
+    resistance = max(signal.resistance for signal in signals[:3])
+    strong_breakout = current > resistance * 1.012
+    fast_gain = False
+    if len(signals) >= 1:
+        fast_gain = signals[0].price > signals[0].ma20 * 1.018 and signals[0].macd_hist > 0
+    far_from_plan = False
+    if daily is not None:
+        a_low, a_high = setup_range(daily.aggressive)
+        b_low, b_high = setup_range(daily.conservative)
+        nearest = min(distance_to_range(current, a_low, a_high), distance_to_range(current, b_low, b_high))
+        far_from_plan = nearest / max(current, 0.000001) > 0.035
+    return strong_breakout or (fast_gain and far_from_plan)
+
+
+def build_strong_trend_plans(current: float, support: float, resistance: float, rmb_capital: float, risk_pct: float, leverage: int, rate: float, must_mode: str = "normal") -> dict[str, ForcedPlan | str | float]:
+    leverage = min(int(leverage), 3)
+    base_risk = min(float(risk_pct), 1.0)
+    pullback_low = resistance * 0.997
+    pullback_high = resistance * 1.006
+    pullback_entry = (pullback_low + pullback_high) / 2
+    pullback_stop = min(resistance * 0.988, pullback_entry * 0.99)
+    pullback_risk = max(pullback_entry - pullback_stop, pullback_entry * 0.006)
+    pullback = build_long_plan(
+        current,
+        support,
+        resistance,
+        {
+            "title": "强趋势观察模式",
+            "source": "强趋势回踩",
+            "order_type": "限价回踩单",
+            "entry": pullback_entry,
+            "stop": pullback_stop,
+            "target1": pullback_entry + pullback_risk * 2,
+            "target2": pullback_entry + pullback_risk * 3,
+            "leverage": leverage,
+            "rmb_capital": rmb_capital,
+            "risk_pct": base_risk,
+            "rate": rate,
+            "warning": "回踩突破位不破再轻仓进，不回踩不追。",
+        },
+    )
+    trigger = max(current * 1.006, resistance * 1.012)
+    pursuit_entry = trigger
+    pursuit_stop = max(resistance * 0.995, pursuit_entry * 0.986)
+    pursuit_risk = max(pursuit_entry - pursuit_stop, pursuit_entry * 0.008)
+    pursuit = build_long_plan(
+        current,
+        support,
+        resistance,
+        {
+            "title": "强趋势突破追随单",
+            "source": "强趋势追随",
+            "order_type": "条件单",
+            "entry": pursuit_entry,
+            "stop": pursuit_stop,
+            "target1": pursuit_entry + pursuit_risk * 2,
+            "target2": pursuit_entry + pursuit_risk * 3,
+            "leverage": leverage,
+            "rmb_capital": rmb_capital,
+            "risk_pct": min(base_risk, 0.5),
+            "rate": rate,
+            "warning": "只有价格放量站稳新高，才允许小仓追随；这是高风险追随单，不是最佳位置。",
+        },
+    )
+    if must_mode == "now":
+        now_stop = min(max(support, current * 0.986), current * 0.995)
+        now_risk = max(current - now_stop, current * 0.006)
+        forced_now = build_long_plan(
+            current,
+            support,
+            resistance,
+            {
+                "title": "强趋势现在强制进场方案",
+                "source": "强趋势强制轻仓",
+                "order_type": "计划委托",
+                "entry": current,
+                "stop": now_stop,
+                "target1": current + now_risk * 2,
+                "target2": current + now_risk * 3,
+                "leverage": leverage,
+                "rmb_capital": rmb_capital,
+                "risk_pct": 0.5,
+                "rate": rate,
+                "warning": "强制追涨单，风险高。仓位减半，风险比例降到0.5%，不能加仓，不能取消止损。",
+            },
+        )
+        selected = forced_now
+    else:
+        selected = pullback
+    return {
+        "current": current,
+        "breakout": resistance,
+        "pullback_low": pullback_low,
+        "pullback_high": pullback_high,
+        "invalid": resistance * 0.99,
+        "pullback": pullback,
+        "pursuit": pursuit,
+        "selected": selected,
+        "abandon": f"如果价格跌回 {resistance * 0.99:,.2f} 下方，或者放量冲高后快速回落，放弃本次交易，等待重新整理。",
+    }
+
+
+def render_strong_trend_mode(symbol: str, mode_data: dict[str, ForcedPlan | str | float], coin: str, unit: str, margin_mode: str, fee_pct: float, rmb_capital: float, rate: float, must_mode: str) -> None:
+    selected = mode_data["selected"]
+    pullback = mode_data["pullback"]
+    pursuit = mode_data["pursuit"]
+    status = "现在强制轻仓" if must_mode == "now" else "强势拉升中，禁止盲目追高"
+    st.markdown(
+        f"""
+        <div class='hero-card'>
+            <div class='hero-symbol'>强趋势观察模式 · {symbol}</div>
+            <div class='hero-price'>{status}</div>
+            <div class='hero-line'>价格已经快速偏离原计划区，直接市价追单风险高。等待回踩突破位不破，或者等待下一根K线确认。</div>
+            <div>
+                <span class='pill pill-yellow'>当前建议：不市价追，等回踩确认</span>
+                <span class='pill pill-green'>最优方案：回踩突破位不破再轻仓做多</span>
+                <span class='pill pill-red'>价格已经跑远，不追。</span>
+            </div>
+            <div class='kv-grid' style='margin-top:18px'>
+                <div class='kv'><div class='kv-label'>当前价格</div><div class='kv-value'>{mode_data["current"]:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>突破位</div><div class='kv-value yellow'>{mode_data["breakout"]:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>回踩观察区</div><div class='kv-value yellow'>{mode_data["pullback_low"]:,.2f} - {mode_data["pullback_high"]:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>失效价</div><div class='kv-value red'>{mode_data["invalid"]:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>目标1</div><div class='kv-value green'>{selected.target1:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>目标2</div><div class='kv-value green'>{selected.target2:,.2f}</div></div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='section-title'>强趋势三个处理方案</div>", unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        html_card(
+            "方案1：回踩确认多单（推荐）",
+            f"""
+            <div class='kv-grid'>
+                <div class='kv'><div class='kv-label'>等待回踩</div><div class='kv-value yellow'>{mode_data["pullback_low"]:,.2f} - {mode_data["pullback_high"]:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>理想入场</div><div class='kv-value'>{pullback.entry:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>止损</div><div class='kv-value red'>{pullback.stop:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>目标1</div><div class='kv-value green'>{pullback.target1:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>目标2</div><div class='kv-value green'>{pullback.target2:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>仓位</div><div class='kv-value'>{pullback.position_usdt:,.2f} USDT</div></div>
+                <div class='kv'><div class='kv-label'>最多亏损</div><div class='kv-value red'>{pullback.max_loss_usdt:,.2f} USDT / {pullback.loss_rmb:,.2f} RMB</div></div>
+                <div class='kv'><div class='kv-label'>预计盈利</div><div class='kv-value green'>{pullback.profit1_usdt:,.2f} / {pullback.profit2_usdt:,.2f} USDT</div></div>
+            </div>
+            <div class='notice'>回踩不破再轻仓进，不回踩不追。</div>
+            """,
+            "setup-card risk-low",
+        )
+    with col2:
+        html_card(
+            "方案2：突破追随单（高风险）",
+            f"""
+            <div class='kv-grid'>
+                <div class='kv'><div class='kv-label'>触发价</div><div class='kv-value yellow'>{pursuit.entry:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>入场价</div><div class='kv-value'>{pursuit.entry:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>止损</div><div class='kv-value red'>{pursuit.stop:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>目标1</div><div class='kv-value green'>{pursuit.target1:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>目标2</div><div class='kv-value green'>{pursuit.target2:,.2f}</div></div>
+                <div class='kv'><div class='kv-label'>仓位减半</div><div class='kv-value'>{pursuit.position_usdt:,.2f} USDT</div></div>
+                <div class='kv'><div class='kv-label'>风险等级</div><div class='kv-value red'>高</div></div>
+            </div>
+            <div class='notice danger-notice'>只有价格放量站稳 {pursuit.entry:,.2f} 上方，才允许小仓追随。这不是最佳位置。</div>
+            """,
+            "setup-card risk-high",
+        )
+    html_card("方案3：放弃条件", f"<div class='notice danger-notice'>{mode_data['abandon']}</div>")
+    if must_mode == "now":
+        st.error("强制追涨单，风险高：仓位减半，风险比例降到0.5%，杠杆不超过3x，不能加仓。")
+    render_okx_fill(selected, coin, unit, margin_mode, float(mode_data["current"]))
+    render_profit_preview(selected, fee_pct, rmb_capital, rate)
+
+
 def inject_css() -> None:
     st.markdown(
         """
@@ -1730,20 +1929,60 @@ def render_home() -> None:
         st.error("风险过高，不建议。单笔风险超过5%很容易几次亏损就伤到账户。")
     ticker, symbol = symbol_to_yfinance(symbol_input)
     if clicked:
-        for key in ["daily_plan", "forced_plan", "signals", "coin", "unit", "long_short_scores", "selected_plan"]:
+        for key in ["daily_plan", "forced_plan", "signals", "coin", "unit", "long_short_scores", "selected_plan", "strong_trend_data", "strong_trend_symbol"]:
             st.session_state.pop(key, None)
         with st.spinner("正在分析并生成方案..."):
             data = load_all_timeframes(ticker)
             signals = [analyze_timeframe(name, df) for name, df in data.items()]
             signals = [item for item in signals if item is not None]
         if len(signals) < 3:
-            st.error("行情数据不足，无法精确分析。但仍建议：不市价追单，只在关键支撑/压力附近轻仓测试。")
+            snapshot = market_snapshot_from_data(data)
+            if snapshot is None:
+                st.warning("行情数据暂时拿不到完整K线。保守处理：不追高，等回踩，仓位减半；刷新后再重新评估。")
+                return
+            strong_data = build_strong_trend_plans(
+                snapshot["current"],
+                snapshot["support"],
+                snapshot["resistance"],
+                rmb_capital,
+                risk_pct,
+                int(leverage),
+                rate,
+                must_mode,
+            )
+            st.session_state.strong_trend_data = strong_data
+            st.session_state.strong_trend_symbol = symbol
+            st.session_state.coin = base_coin(symbol)
+            st.session_state.unit = unit
+            st.session_state.risk_inputs = {"rmb_capital": rmb_capital, "risk_pct": risk_pct, "leverage": min(int(leverage), 3), "rate": rate, "direction_choice": "long", "fee_pct": fee_pct, "margin_mode": margin_mode, "must_mode": must_mode}
+            st.session_state.forced_plan = strong_data["selected"] if must_mode == "now" else None
+            st.session_state.selected_plan = strong_data["selected"]
+            st.session_state.signals = signals
+            render_strong_trend_mode(symbol, strong_data, base_coin(symbol), unit, margin_mode, fee_pct, rmb_capital, rate, must_mode)
+            st.markdown("<div class='notice'>仅供参考，不构成投资建议，不自动下单。先确定最多亏多少钱，再决定开多少仓。</div>", unsafe_allow_html=True)
+            st.markdown("<div class='notice danger-notice'>不到点位不开仓，没有止损不开仓，亏损金额不能接受不开仓。</div>", unsafe_allow_html=True)
             return
         base_daily = build_daily_plan(symbol, signals, rmb_capital / rate, min(risk_pct, 1))
         long_score, short_score = calculate_long_short_scores(signals)
         side = choose_direction(direction_choice, long_score, short_score)
         candidate_plans = build_candidates(signals, side, rmb_capital, risk_pct, int(leverage), rate)
         daily = daily_with_direction_plans(base_daily, candidate_plans, side)
+        if normalize_side(side) == "long" and is_strong_trend(signals, daily, candidate_plans):
+            current = daily.current_price
+            resistance = max(signal.resistance for signal in signals[:3])
+            support = min(signal.support for signal in signals[:3])
+            strong_data = build_strong_trend_plans(current, support, resistance, rmb_capital, risk_pct, int(leverage), rate, must_mode)
+            if must_mode == "now":
+                st.session_state.now_force_count = st.session_state.get("now_force_count", 0) + 1
+            st.session_state.strong_trend_data = strong_data
+            st.session_state.strong_trend_symbol = symbol
+            st.session_state.coin = base_coin(symbol)
+            st.session_state.unit = unit
+            st.session_state.risk_inputs = {"rmb_capital": rmb_capital, "risk_pct": min(risk_pct, 0.5) if must_mode == "now" else risk_pct, "leverage": min(int(leverage), 3), "rate": rate, "direction_choice": "long", "fee_pct": fee_pct, "margin_mode": margin_mode, "must_mode": must_mode}
+            st.session_state.forced_plan = strong_data["selected"] if must_mode == "now" else None
+            st.session_state.selected_plan = strong_data["selected"]
+            st.session_state.signals = signals
+            return
         is_choppy_choice = direction_choice == "auto" and abs(long_score - short_score) < 5
         if must_mode == "now":
             st.session_state.now_force_count = st.session_state.get("now_force_count", 0) + 1
@@ -1764,6 +2003,22 @@ def render_home() -> None:
         st.session_state.unit = unit
         st.session_state.long_short_scores = (long_score, short_score)
         st.session_state.risk_inputs = {"rmb_capital": rmb_capital, "risk_pct": risk_pct, "leverage": int(leverage), "rate": rate, "direction_choice": direction_choice, "fee_pct": fee_pct, "margin_mode": margin_mode, "must_mode": must_mode}
+    if st.session_state.get("strong_trend_data") is not None:
+        risk_inputs = st.session_state.get("risk_inputs", {"rmb_capital": 1000, "risk_pct": 1, "leverage": 3, "rate": 7.2, "fee_pct": 0.05, "margin_mode": "逐仓", "must_mode": "normal"})
+        render_strong_trend_mode(
+            st.session_state.get("strong_trend_symbol", symbol),
+            st.session_state.strong_trend_data,
+            st.session_state.get("coin", base_coin(symbol)),
+            st.session_state.get("unit", unit),
+            risk_inputs["margin_mode"],
+            risk_inputs["fee_pct"],
+            risk_inputs["rmb_capital"],
+            risk_inputs["rate"],
+            risk_inputs.get("must_mode", "normal"),
+        )
+        st.markdown("<div class='notice'>仅供参考，不构成投资建议，不自动下单。先确定最多亏多少钱，再决定开多少仓。</div>", unsafe_allow_html=True)
+        st.markdown("<div class='notice danger-notice'>不到点位不开仓，没有止损不开仓，亏损金额不能接受不开仓。</div>", unsafe_allow_html=True)
+        return
     if any(key not in st.session_state for key in required_state):
         st.markdown("<div class='notice'>页面状态已更新，请在左侧重新点击“生成交易面板”。</div>", unsafe_allow_html=True)
         return
